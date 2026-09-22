@@ -1,6 +1,8 @@
 # Owner(s): ["oncall: pt2"]
 import copy
 import errno
+import importlib
+import inspect
 import io
 import os
 import pickle
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import typing
 import unittest
 from unittest import mock
 
@@ -52,17 +55,28 @@ _pytree.register_pytree_node(
     serialized_type_name="test_precompile._UnserializableCtxInput",
 )
 
+_PRECOMPILE_PUBLIC_MEMBERS = [
+    name
+    for name in dir(torch.compiler.precompile)
+    if not name.startswith("_") and callable(getattr(torch.compiler.precompile, name))
+]
+
 
 def _precompile_pair(fn, *args, **kwargs):
-    """The callable API, behind one indirection: the module switch above this commit
-    retires ``torch.compiler.precompile(fn, *args)`` and re-points these two helpers
-    at the make_fx internals it drove, so every test below keeps covering them."""
-    return torch.compiler.precompile(fn, *args, **kwargs)
+    """A rendered (python_code, cache) pair, built the way the retired callable
+    ``torch.compiler.precompile(fn, *args, **kwargs)`` built the one it returned."""
+    from torch._precompile import PrecompiledModule
+
+    compiled = PrecompiledModule(fn, **kwargs)
+    compiled._compile(args)
+    python_code = compiled.to_python_code()
+    return python_code, compiled.to_cache_bytes(python_code)
 
 
 def _load_pair(python_code, cache):
-    """The callable API's ``load``, behind the same indirection as ``_precompile_pair``."""
-    return torch.compiler.precompile.load(python_code, cache)
+    """Reconstruct a runnable from an in-memory pair, through the loader core the
+    retired callable API's ``load`` became."""
+    return torch._precompile._runnable_from_pair(python_code, cache)
 
 
 def _strip_artifact(cache: bytes) -> bytes:
@@ -1657,30 +1671,6 @@ class TestPrecompile(TestCase):
             finally:
                 _register_effectful_op(op, None)
 
-    def test_public_api_surface(self):
-        # precompile is a public API under the compiler namespace
-        # (torch.compiler.precompile), with a load method and a public error type;
-        # it is deliberately NOT a top-level torch.* verb.
-        self.assertIn("precompile", torch.compiler.__all__)
-        self.assertNotIn("precompile", torch.__all__)
-        # __all__ membership and the attribute itself are independent, so lock in
-        # removal of the top-level entry point too (re-adding the re-export without
-        # touching __all__ would silently resurrect torch.precompile).
-        self.assertFalse(hasattr(torch, "precompile"))
-        self.assertTrue(callable(torch.compiler.precompile))
-        self.assertTrue(callable(torch.compiler.precompile.load))
-        self.assertIs(torch.compiler.precompile.PrecompileError, PrecompileError)
-        # The public location: test_public_bindings.test_correct_module_names also
-        # enforces this for every torch.compiler.__all__ member.
-        self.assertEqual(torch.compiler.precompile.__module__, "torch.compiler")
-
-    def test_backend_invalid_raises(self):
-        a, b = torch.randn(4, 4), torch.randn(4, 4)
-        with self.assertRaisesRegex(
-            ValueError, "backend must be 'inductor' or 'eager'"
-        ):
-            _precompile_pair(lambda x, y: x + y, a, b, backend="nope")
-
     def test_tracer_default_and_explicit_make_fx(self):
         # tracer defaults to "make_fx"; passing it explicitly is equivalent and works.
         m = torch.nn.Linear(4, 3).eval()
@@ -1696,11 +1686,6 @@ class TestPrecompile(TestCase):
         x = torch.randn(5, 4)
         with self.assertRaisesRegex(NotImplementedError, "tracer='dynamo'"):
             _precompile_pair(lambda model, xx: model(xx), m, x, tracer="dynamo")
-
-    def test_tracer_invalid_raises(self):
-        a, b = torch.randn(4, 4), torch.randn(4, 4)
-        with self.assertRaisesRegex(ValueError, "tracer must be 'make_fx' or 'dynamo'"):
-            _precompile_pair(lambda x, y: x + y, a, b, tracer="nope")
 
     def test_backend_default_is_inductor(self):
         # The default lowers through Inductor: the generated code inlines the Inductor
@@ -2284,15 +2269,6 @@ class TestPrecompile(TestCase):
         ):
             _load_pair("x = 1\n", buf.getvalue())
 
-    def test_singleton_pickle_deepcopy_roundtrip(self):
-        # torch.compiler.precompile is a process-wide singleton; pickle and deepcopy
-        # must round-trip to the SAME object (it carries no per-call state), and its
-        # repr is the stable public name.
-        p = torch.compiler.precompile
-        self.assertIs(pickle.loads(pickle.dumps(p)), p)
-        self.assertIs(copy.deepcopy(p), p)
-        self.assertEqual(repr(p), "torch.compiler.precompile")
-
     def test_standalone_runtime_artifact_execs_in_fresh_process(self):
         # A generated artifact that imports a standalone_runtime helper (here output-
         # aliasing, which emits ``from ...standalone_runtime import gen_alias_from_base``)
@@ -2387,16 +2363,6 @@ class TestPrecompile(TestCase):
             f(m, x)
         except AssertionError as e:
             self.assertNotIn("shape or memory format", str(e))
-
-    def test_public_identity_module_and_qualname(self):
-        # PrecompileError and load are public under torch.compiler.precompile, so their
-        # __module__ / __qualname__ must report that public location (so Sphinx and
-        # introspection anchor them under torch.compiler, not the private module).
-        err = torch.compiler.precompile.PrecompileError
-        self.assertEqual(err.__module__, "torch.compiler")
-        self.assertEqual(err.__qualname__, "precompile.PrecompileError")
-        self.assertEqual(torch.compiler.precompile.load.__module__, "torch.compiler")
-        self.assertEqual(torch.compiler.precompile.load.__qualname__, "precompile.load")
 
     @parametrize("backend", ("inductor", "eager"))
     def test_renamed_buffer_structural_mismatch_rejected(self, backend):
@@ -2824,6 +2790,45 @@ class TestPrecompile(TestCase):
         ref.load_state_dict(m.state_dict())
         ref(x).sum().backward()
         self.assertEqual(run.weight.grad, ref.weight.grad)
+
+    def test_precompile_public_members_are_the_exported_types(self):
+        # Pins the list the parametrized tests below iterate over: an emptied
+        # export list would otherwise generate no cases and pass vacuously.
+        exported = {"Capture", "MakeFxTracer", "PrecompileSummary"}
+        members = set(_PRECOMPILE_PUBLIC_MEMBERS)
+        self.assertEqual(set(torch.compiler.precompile.__all__), exported)
+        self.assertEqual(members, exported | {"PrecompileError"})
+
+    @parametrize("name", _PRECOMPILE_PUBLIC_MEMBERS)
+    def test_precompile_public_members_resolve(self, name):
+        # The re-homing to torch.compiler.precompile must leave every annotation
+        # resolvable (get_type_hints looks names up through __module__) and resolved.
+        member = getattr(torch.compiler.precompile, name)
+        hints = typing.get_type_hints(member)
+        self.assertEqual(set(hints), set(inspect.get_annotations(member)))
+        for hint in hints.values():
+            self.assertNotIsInstance(hint, str)
+
+    def test_precompile_module_identity(self):
+        # torch.compiler.precompile is a submodule: re-importing it resolves to the
+        # SAME module object, and its name is the stable public path.
+        p = torch.compiler.precompile
+        self.assertIs(importlib.import_module("torch.compiler.precompile"), p)
+        self.assertIs(sys.modules["torch.compiler.precompile"], p)
+        self.assertEqual(p.__name__, "torch.compiler.precompile")
+
+    @parametrize("name", _PRECOMPILE_PUBLIC_MEMBERS)
+    def test_precompile_member_module_and_qualname_resolve_to_it(self, name):
+        # Each member's __module__/__qualname__ walk back to the object itself,
+        # so pickle and test_public_bindings resolve it at the public path. The
+        # re-homing costs inspect.getsource, which reads the file of
+        # sys.modules[cls.__module__] and finds no class there; torch.onnx makes
+        # the same trade for its public types.
+        member = getattr(torch.compiler.precompile, name)
+        target = sys.modules[member.__module__]
+        for part in member.__qualname__.split("."):
+            target = getattr(target, part)
+        self.assertIs(target, getattr(member, "__func__", member))
 
     def test_nested_input_refused(self):
         # A nested example input is refused up front with a named PrecompileError rather
