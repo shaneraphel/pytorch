@@ -21,7 +21,7 @@ from torch.distributed.fsdp._common_utils import collect_grad_tensors
 from torch.distributed.utils import _apply_to_tensors, _to_kwargs
 
 from ._fsdp_api import MixedPrecisionPolicy
-from ._fsdp_common import _cast_fp_tensor, _dynamo_disable, TrainingState
+from ._fsdp_common import _cast_fp_tensor, _dynamo_disable, DDPMeshInfo, TrainingState
 from ._fsdp_param_group import FSDPCommContext, FSDPParamGroup
 
 
@@ -51,6 +51,8 @@ class FSDPStateContext(Generic[_StateType]):
         self.post_backward_final_callback_queued: bool = False
         # Whether to finalize backward in this backward's final callback
         self.is_last_backward: bool = True
+        # Whether backward finalization is owned by the caller
+        self.manual_backward_finalization: bool = False
         # Optional user-provided event recorded after optimizer for the
         # all-gather streams to wait on in the root pre-forward
         self.post_optim_event: torch.Event | None = None
@@ -177,12 +179,23 @@ class FSDPState(_State):
         """
         if self._is_root is not None:
             return  # no-op: already initialized
-        self._is_root = True
         if len(self._modules) > 1:
             raise RuntimeError(
                 f"{self._state_name} requires a single root module but got {self._modules}"
             )
         root_module = self._modules[0]
+        for module in root_module.modules():
+            state = self._get_state_for_module(module)
+            if (
+                state is not None
+                and state is not self
+                and state._state_ctx.manual_backward_finalization
+            ):
+                raise RuntimeError(
+                    "set_manual_backward_finalization must be called on the "
+                    f"root {self._state_name} module"
+                )
+        self._is_root = True
         visited_states: set[FSDPState] = set()
         for module_name, module in root_module.named_modules():
             if (state := self._get_state_for_module(module)) is None:
@@ -416,26 +429,107 @@ class FSDPState(_State):
                 # per-param-mesh modules whose inputs lack gradients.
                 for fsdp_param_group in reversed(state._fsdp_param_groups):
                     if fsdp_param_group._training_state != TrainingState.POST_BACKWARD:
-                        # Run post-backward in case forward inputs did not require
-                        # gradient so the autograd backward did not run
-                        fsdp_param_group.post_backward()
+                        if (
+                            self._state_ctx.manual_backward_finalization
+                            and fsdp_param_group.reduce_grads
+                        ):
+                            fsdp_param_group._post_backward_pending = True
+                        else:
+                            # Run post-backward in case forward inputs did not require
+                            # gradient so the autograd backward did not run
+                            fsdp_param_group.post_backward()
                     fsdp_param_group._training_state = TrainingState.IDLE
                 state._training_state = TrainingState.IDLE
-                if self._state_ctx.is_last_backward:
-                    for fsdp_param_group in state._fsdp_param_groups:
-                        fsdp_param_group.finalize_backward()
-            if self._state_ctx.is_last_backward:
-                self._comm_ctx.post_forward_order.clear()
-                # Wait on and release any retained reduce-scatter input buffers:
-                # the last module's (which no later module's rs_wait clears) and,
-                # when set_reduce_scatter_max_input_buffers retains more than
-                # one in flight, the rest. The compute stream (which reuses the
-                # memory) is ordered past each reduce-scatter first.
-                for rs_state in self._comm_ctx.reduce_scatter_states:
-                    if rs_state.event is not None:
-                        self._device_handle.current_stream().wait_event(rs_state.event)
-                self._comm_ctx.reduce_scatter_states.clear()
+            if (
+                self._state_ctx.is_last_backward
+                and not self._state_ctx.manual_backward_finalization
+            ):
+                self._end_backward_iteration()
             self._state_ctx.post_backward_final_callback_queued = False
+
+    def finalize_backward(self) -> None:
+        if self._is_root is None:
+            return
+        logger.debug("%s::finalize_backward", self._state_name)
+        with torch.profiler.record_function(f"{self._state_name}::finalize_backward"):
+            if not self._is_root:
+                raise RuntimeError(
+                    "finalize_backward must be called on the root "
+                    f"{self._state_name} module"
+                )
+            if not self._state_ctx.manual_backward_finalization:
+                raise RuntimeError(
+                    f"{self._state_name} finalize_backward requires manual backward "
+                    "finalization. Call "
+                    "set_manual_backward_finalization(True) before forward"
+                )
+            if self._state_ctx.post_backward_final_callback_queued:
+                raise RuntimeError(
+                    f"{self._state_name} finalize_backward must be called after "
+                    "backward completes"
+                )
+            param_groups = [
+                group
+                for fsdp_state in self._state_ctx.all_states
+                for group in fsdp_state._fsdp_param_groups
+            ]
+            if partial_group := next(
+                (
+                    group
+                    for group in param_groups
+                    if group._partial_reduce_output is not None
+                ),
+                None,
+            ):
+                group_name = partial_group._module_fqn or "<root>"
+                raise RuntimeError(
+                    f"{self._state_name} manual backward finalization does not support "
+                    f"partial gradient reductions for parameter group {group_name!r}. "
+                    "Use automatic backward finalization for this configuration"
+                )
+            if no_all_reduce_group := next(
+                (
+                    group
+                    for group in param_groups
+                    if group._post_backward_pending
+                    and group.reduce_grads
+                    and isinstance(group.mesh_info, DDPMeshInfo)
+                    and not group.all_reduce_grads
+                ),
+                None,
+            ):
+                group_name = no_all_reduce_group._module_fqn or "<root>"
+                raise RuntimeError(
+                    f"{self._state_name} manual backward finalization requires "
+                    f"all-reduce for parameter group {group_name!r}. Call "
+                    "set_requires_all_reduce(True) before finalization"
+                )
+            # Autograd has completed, and _end_backward_iteration waits for these
+            # reductions before returning, so no inter-autograd wait is needed.
+            for fsdp_state in reversed(self._state_ctx.all_states):
+                for group in reversed(fsdp_state._fsdp_param_groups):
+                    if group._post_backward_pending:
+                        group.post_backward()
+                    elif group.reshard_after_backward:
+                        with _spmd_no_typecheck():
+                            group.reshard()
+                    group._training_state = TrainingState.IDLE
+            self._end_backward_iteration()
+
+    def _end_backward_iteration(self) -> None:
+        for state in self._state_ctx.all_states:
+            for fsdp_param_group in state._fsdp_param_groups:
+                fsdp_param_group.finalize_backward()
+        self._comm_ctx.post_forward_order.clear()
+        # Wait on and release any retained reduce-scatter input buffers:
+        # the last module's (which no later module's rs_wait clears) and,
+        # when set_reduce_scatter_max_input_buffers retains more than
+        # one in flight, the rest. The compute stream (which reuses the
+        # memory) is ordered past each reduce-scatter first.
+        for rs_state in self._comm_ctx.reduce_scatter_states:
+            if rs_state.event is not None:
+                self._device_handle.current_stream().wait_event(rs_state.event)
+        self._comm_ctx.reduce_scatter_states.clear()
 
     def _register_pre_backward_hook(self, output: Any) -> Any:
         if not torch.is_grad_enabled():
