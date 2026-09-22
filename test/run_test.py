@@ -922,6 +922,35 @@ def run_test_retries(
     return ret_code, any(x > 0 for x in num_failures.values())
 
 
+def run_gloo_test(test_module, test_directory, options):
+    args = options.additional_args
+    if (
+        not options.pytest
+        or not test_module.test.is_full_file()
+        or options.pytest_k_expr
+        or options.pytest_xdist_workers is not None
+        or options.continue_through_error
+        or options.coverage
+        or options.dynamo
+        or options.inductor
+        or RERUN_DISABLED_TESTS
+        or (args and not (len(args) == 2 and args[0] == "-m"))
+    ):
+        return run_test_with_subprocess(test_module, test_directory, options)
+
+    selected = "ProcessGroupGlooTest"
+    for expression, handler in (
+        (selected, run_test),
+        (f"not ({selected})", run_test_with_subprocess),
+    ):
+        subset_options = copy.copy(options)
+        subset_options.pytest_k_expr = expression
+        result = handler(test_module, test_directory, subset_options)
+        if result:
+            return result
+    return 0
+
+
 def run_test_with_subprocess(test_module, test_directory, options):
     return run_test(
         test_module, test_directory, options, extra_unittest_args=["--subprocess"]
@@ -1148,7 +1177,8 @@ def test_distributed(test_module, test_directory, options):
                     test_module,
                     test_directory,
                     options,
-                    extra_unittest_args=["--subprocess"],
+                    # Each test already creates fresh rank processes.
+                    extra_unittest_args=[],
                 )
             if return_code != 0:
                 return return_code
@@ -1412,17 +1442,13 @@ CUSTOM_HANDLERS = {
     "distributed/test_distributed_spawn": test_distributed,
     "distributed/algorithms/quantization/test_quantization": test_distributed,
     "distributed/test_c10d_nccl": run_test_with_subprocess,
-    "distributed/test_c10d_gloo": run_test_with_subprocess,
+    "distributed/test_c10d_gloo": run_gloo_test,
     "distributed/test_c10d_ucc": run_test_with_subprocess,
     "distributed/test_c10d_common": run_test_with_subprocess,
     "distributed/test_c10d_spawn_gloo": run_test_with_subprocess,
-    "distributed/test_c10d_spawn_nccl": run_test_with_subprocess,
     "distributed/test_c10d_spawn_ucc": run_test_with_subprocess,
     "distributed/test_pg_wrapper": run_test_with_subprocess,
-    "distributed/rpc/test_faulty_agent": run_test_with_subprocess,
-    "distributed/rpc/test_tensorpipe_agent": run_test_with_subprocess,
     "distributed/rpc/test_share_memory": run_test_with_subprocess,
-    "distributed/rpc/cuda/test_tensorpipe_agent": run_test_with_subprocess,
     "functorch/test_control_flow_cuda_initialization": run_test_with_subprocess,
     "doctests": run_doctests,
     "test_ci_sanity_check_fail": run_ci_sanity_check,
