@@ -1128,12 +1128,91 @@ def reduce_scatter_with_assert(
     return orig_reduce_scatter(*args, **kwargs)
 
 
+def _assert_equal_batched(cls, pairs: list[tuple[torch.Tensor, torch.Tensor]]):
+    if (
+        torch.utils._python_dispatch._get_current_dispatch_mode() is not None
+        or torch.overrides._get_current_function_mode() is not None
+    ):
+        for actual, expected in pairs:
+            cls.assertEqual(actual, expected)
+        return
+    groups = {}
+    for actual, expected in pairs:
+        if (
+            type(actual) not in (torch.Tensor, nn.Parameter)
+            or type(expected) not in (torch.Tensor, nn.Parameter)
+            or actual.layout != torch.strided
+            or expected.layout != torch.strided
+            or actual.is_quantized
+            or expected.is_quantized
+            or actual.device.type == "meta"
+            or actual.shape != expected.shape
+            or actual.dtype != expected.dtype
+            or actual.device != expected.device
+        ):
+            # Preserve the original comparison for unsupported attributes/types.
+            for a, b in pairs:
+                cls.assertEqual(a, b)
+            return
+        groups.setdefault((actual.device, actual.dtype), []).append((actual, expected))
+    try:
+        for group in groups.values():
+            if len(group) == 1:
+                cls.assertEqual(*group[0])
+                continue
+            with torch.no_grad():
+                actual = torch.cat([a.reshape(-1) for a, _ in group])
+                expected = torch.cat([b.reshape(-1) for _, b in group])
+            cls.assertEqual(actual, expected)
+    except AssertionError:
+        # Report the original per-parameter diagnostic on mismatch.
+        for actual, expected in pairs:
+            cls.assertEqual(actual, expected)
+        raise
+
+
 def check_sharded_parity(
     cls,  # unit test class
     replicated_module: nn.Module,
     sharded_module: nn.Module,
     prefixes_to_ignore: tuple[str, ...] = (),
 ):
+    # Batch small value checks to avoid a device synchronization per parameter.
+    # Keep reference distribution and metadata checks unchanged.
+    pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    buffered_bytes = 0
+    batch_values = (
+        torch.utils._python_dispatch._get_current_dispatch_mode() is None
+        and torch.overrides._get_current_function_mode() is None
+    )
+
+    def check_values(actual, expected):
+        nonlocal buffered_bytes
+        if (
+            not batch_values
+            or type(actual) is not torch.Tensor
+            or type(expected) is not torch.Tensor
+        ):
+            _assert_equal_batched(cls, pairs)
+            pairs.clear()
+            buffered_bytes = 0
+            cls.assertEqual(actual, expected)
+            return
+        size = (
+            actual.numel() * actual.element_size()
+            + expected.numel() * expected.element_size()
+        )
+        # Bound retained payload and concatenation storage; compare large pairs directly.
+        if buffered_bytes + size > 1024 * 1024:
+            _assert_equal_batched(cls, pairs)
+            pairs.clear()
+            buffered_bytes = 0
+        if size > 1024 * 1024:
+            cls.assertEqual(actual, expected)
+            return
+        pairs.append((actual, expected))
+        buffered_bytes += size
+
     for (replicated_name, replicated_param), (sharded_name, sharded_param) in zip(
         replicated_module.named_parameters(),
         sharded_module.named_parameters(),
@@ -1153,7 +1232,7 @@ def check_sharded_parity(
                 "so we cannot check for equality using it"
             )
         sharded_ref_param = distribute_tensor(replicated_param, mesh, placements)
-        cls.assertEqual(sharded_param.to_local(), sharded_ref_param.to_local())
+        check_values(sharded_param.to_local(), sharded_ref_param.to_local())
         if replicated_param.grad is None:
             cls.assertIsNone(sharded_param.grad)
             continue
@@ -1162,7 +1241,9 @@ def check_sharded_parity(
         cls.assertIsInstance(sharded_param.grad, DTensor)
         if not isinstance(sharded_param.grad, DTensor):
             raise AssertionError("Expected sharded_param.grad to be a DTensor")  # mypy
-        cls.assertEqual(sharded_param.grad.to_local(), sharded_ref_grad.to_local())
+        check_values(sharded_param.grad.to_local(), sharded_ref_grad.to_local())
+
+    _assert_equal_batched(cls, pairs)
 
 
 class FSDPTestMultiThread(MultiThreadedTestCase):
@@ -1386,15 +1467,23 @@ class FSDPTestMixin:
             raise AssertionError("Expects an FSDP init mode that wraps with FSDP")
         if init_kwargs is None:
             init_kwargs = {}
+        offload_params = cpu_offload is not None and cpu_offload.offload_params
+        expects_device_error = (
+            offload_params and device_init_mode == DEVICEInitMode.DEVICE_AFTER
+        )
         lr = 1e-2
         rank = self.process_group.rank()
+        # Delays exercise FSDP stream ordering, not reference numerics.
+        ref_init_kwargs = init_kwargs.copy()
+        if "delay_after_loss_ms" in ref_init_kwargs:
+            ref_init_kwargs["delay_after_loss_ms"] = 0
         # Establish reference behavior with DDP
         model = model_class.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
             DEVICEInitMode.DEVICE_BEFORE,
             deterministic=True,
-            **init_kwargs,
+            **ref_init_kwargs,
         )
         if ref_init_fn is None:
             if TEST_HPU:
@@ -1410,17 +1499,18 @@ class FSDPTestMixin:
             ref_model = ref_init_fn(model)
         if use_pure_fp16:
             ref_model = ref_model.half()
-        ref_loss = self._train_for_several_steps(
-            ref_model,
-            num_iters,
-            autocast=mixed_precision is not None,
-            lr=lr,
-            fsdp_cpu_offload=cpu_offload,
-            mixed_precision=mixed_precision,
-            enable_sharded_grad_scaler=enable_sharded_grad_scaler,
-            use_pure_fp16=use_pure_fp16,
-            sharded_grad_scaler_kwargs=sharded_grad_scaler_kwargs,
-        )
+        if not expects_device_error:
+            ref_loss = self._train_for_several_steps(
+                ref_model,
+                num_iters,
+                autocast=mixed_precision is not None,
+                lr=lr,
+                fsdp_cpu_offload=cpu_offload,
+                mixed_precision=mixed_precision,
+                enable_sharded_grad_scaler=enable_sharded_grad_scaler,
+                use_pure_fp16=use_pure_fp16,
+                sharded_grad_scaler_kwargs=sharded_grad_scaler_kwargs,
+            )
         ddp_params = list(ref_model.parameters())
         # Check against FSDP behavior
         fsdp_kwargs.update(
@@ -1454,13 +1544,9 @@ class FSDPTestMixin:
             fsdp_model = fsdp_model.half()
         if device_init_mode == DEVICEInitMode.DEVICE_AFTER:
             fsdp_model = fsdp_model.to(DEVICE_TYPE)
-        offload_params = cpu_offload is not None and cpu_offload.offload_params
         # Offloading parameters with `DEVICE_AFTER` should raise an error during
         # lazy initialization due to the parameter devices not being CPU;
         # otherwise, all parameter devices should be CPU
-        expects_device_error = (
-            offload_params and device_init_mode == DEVICEInitMode.DEVICE_AFTER
-        )
         expects_cpu_device = (
             offload_params and device_init_mode != DEVICEInitMode.DEVICE_AFTER
         )
