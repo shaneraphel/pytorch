@@ -1,6 +1,7 @@
 # Owner(s): ["oncall: pt2"]
 import copy
 import errno
+import functools
 import importlib
 import inspect
 import io
@@ -20,7 +21,7 @@ import torch.utils._pytree as _pytree
 from torch._dynamo.decorators import mark_dynamic, mark_unbacked
 from torch._precompile import _write_artifact, PrecompileError
 from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.compiler.precompile import load, PrecompiledRunnable
+from torch.compiler.precompile import capture, load, MakeFxTracer, PrecompiledRunnable
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing import make_tensor
 from torch.testing._internal.common_cuda import TEST_CUDA
@@ -2799,6 +2800,7 @@ class TestPrecompile(TestCase):
         # Pins the list the parametrized tests below iterate over: an emptied
         # export list would otherwise generate no cases and pass vacuously.
         exported = {
+            "capture",
             "load",
             "Capture",
             "MakeFxTracer",
@@ -4052,6 +4054,110 @@ class TestPrecompileLoad(TestCase):
         self.assertEqual(
             load(self.artifact, self.cache)(self.model, self.x), self.model(self.x)
         )
+
+
+@skipIfTorchDynamo("precompile's make_fx capture is incompatible with dynamo wrapping")
+@instantiate_parametrized_tests
+class TestPrecompileCapture(TestCase):
+    """capture() and load() over the on-disk pair, with the MakeFxTracer."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.artifact = os.path.join(self.dir, "m.py")
+        self.cache = os.path.join(self.dir, "m.cache")
+        self.model = _FilesModel()
+        self.x = torch.randn(2, 4)
+
+    def _capture(self, fn=_files_fn, **kwargs):
+        kwargs.setdefault("tracer", MakeFxTracer())
+        return capture(fn, artifact_path=self.artifact, cache_path=self.cache, **kwargs)
+
+    @parametrize("backend", ["inductor", "eager"])
+    def test_capture_and_load_round_trip(self, backend):
+        with self._capture(backend=backend) as cap:
+            y = cap(self.model, self.x)
+        # The call is served through the artifact and returns what fn returns.
+        self.assertEqual(y, self.model(self.x))
+        self.assertTrue(os.path.exists(self.artifact))
+        self.assertTrue(os.path.exists(self.cache))
+        f = load(self.artifact, self.cache)
+        self.assertIsInstance(f, PrecompiledRunnable)
+        self.assertFalse(f.installed)
+        self.assertEqual(f(self.model, self.x), self.model(self.x))
+        # No weights are baked in: a structurally identical model with other
+        # weights serves its own answer.
+        other = _FilesModel()
+        self.assertEqual(f(other, self.x), other(self.x))
+        # A standalone artifact installs nothing, so the handle's context
+        # manager and unload() are no-ops.
+        with f as entered:
+            self.assertIs(entered, f)
+        f.unload()
+        self.assertEqual(f(self.model, self.x), self.model(self.x))
+
+    def test_a_make_fx_capture_takes_exactly_one_positional_call(self):
+        with self._capture(backend="eager") as cap:
+            with self.assertRaisesRegex(ValueError, "positional arguments only"):
+                cap(self.model, x=self.x)
+            cap(self.model, self.x)
+            with self.assertRaisesRegex(PrecompileError, "single call"):
+                cap(self.model, self.x)
+        self.assertEqual(
+            load(self.artifact, self.cache)(self.model, self.x), self.model(self.x)
+        )
+
+    def test_a_block_without_a_call_or_that_raises_writes_nothing(self):
+        with self.assertRaisesRegex(PrecompileError, "nothing was captured"):
+            with self._capture(backend="eager"):
+                pass
+        self.assertFalse(os.path.exists(self.artifact))
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with self._capture(backend="eager") as cap:
+                cap(self.model, self.x)
+                raise RuntimeError("boom")
+        self.assertFalse(os.path.exists(self.artifact))
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_save_checkpoints_the_pair_exit_rewrites(self):
+        with self._capture(backend="eager") as cap:
+            with self.assertRaisesRegex(PrecompileError, "nothing was captured"):
+                cap.save()
+            cap(self.model, self.x)
+            cap.save()
+            with open(self.artifact, "rb") as f:
+                saved = f.read()
+            self.assertEqual(
+                load(self.artifact, self.cache)(self.model, self.x), self.model(self.x)
+            )
+        with open(self.artifact, "rb") as f:
+            self.assertEqual(f.read(), saved)
+
+    def test_capture_validates_backend_and_tracer(self):
+        with self.assertRaisesRegex(ValueError, "backend must be"):
+            self._capture(backend="nope")
+        with self.assertRaisesRegex(TypeError, "MakeFxTracer"):
+            self._capture(tracer="make_fx")
+        with self.assertRaisesRegex(PrecompileError, "partial"):
+            self._capture(functools.partial(_files_fn, self.model))
+
+    def test_training_capture_scatters_grads_onto_the_runtime_model(self):
+        def train_step(model, x):
+            model(x).sum().backward()
+
+        expected = _FilesModel()
+        expected.load_state_dict(self.model.state_dict())
+        expected(self.x).sum().backward()
+        with self._capture(train_step, backend="eager", training=True) as cap:
+            self.assertIsNone(cap(self.model, self.x))
+        self.assertEqual(self.model.lin.weight.grad, expected.lin.weight.grad)
+        runtime = _FilesModel()
+        runtime.load_state_dict(self.model.state_dict())
+        load(self.artifact, self.cache)(runtime, self.x)
+        self.assertEqual(runtime.lin.weight.grad, expected.lin.weight.grad)
+        self.assertEqual(runtime.lin.bias.grad, expected.lin.bias.grad)
 
 
 if __name__ == "__main__":
